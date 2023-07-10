@@ -1,0 +1,109 @@
+CALL apoc.export.csv.query(
+   'MATCH (n)-[r]->(m) RETURN n,r,m',
+   'results.csv',
+   {quotes:'none',useTypes:true}
+)
+YIELD file,nodes,relationships,properties,time
+       ,rows,batchSize,batches,done,data
+RETURN file,nodes,relationships,properties,time
+       ,rows,batchSize,batches,done,data
+
+CALL gds.graph.project('myGraph', ['my_entity', 'my_entity'], ['also_bought','also_viewed','bought_together','buy_after_viewing']);
+
+CALL gds.beta.node2vec.stream('myGraph', {positiveSamplingFactor:0.1,iterations:25})
+YIELD nodeId, embedding
+RETURN nodeId, embedding limit 50;
+
+CALL gds.graph.project(
+  'myGraph',
+  {
+    my_entity: {}
+  },
+  {
+    also_bought: {
+      orientation: 'UNDIRECTED'
+    },
+    price:{
+        orientation:'UNDIRECTED'
+    },
+    sale_category:{
+       orientation:'UNDIRECTED'
+    },
+    sale_rank:{
+       orientation:'UNDIRECTED'
+    }
+  }
+)
+
+
+MATCH p=(src:my_entity)-[r:price]->(dst:my_entity) return src limit 15
+
+MATCH p=(src:my_entity)-[r:price]->(dst:my_entity) set src.price = dst.name return src limit 15
+MATCH p=(src:my_entity)-[r:sale_category]->(dst:my_entity) set src.sale_category = dst.name return src limit 15
+MATCH p=(src:my_entity)-[r:sale_rank]->(dst:my_entity) set src.sale_rank = dst.name return src limit 15
+
+CALL gds.beta.pipeline.linkPrediction.create('pipe');
+CALL gds.beta.pipeline.linkPrediction.addNodeProperty('pipe', 'fastRP', {
+  mutateProperty: 'embedding',
+  embeddingDimension: 128,
+  randomSeed: 42
+});
+
+CALL gds.beta.pipeline.linkPrediction.addFeature('pipe', 'hadamard', {
+  nodeProperties: ['embedding', 'price','sale_rank']
+}) YIELD featureSteps;
+
+CALL gds.beta.pipeline.linkPrediction.configureSplit('pipe', {
+  testFraction: 0.25,
+  trainFraction: 0.6,
+  validationFolds: 3
+})
+YIELD splitConfig
+
+CALL gds.alpha.pipeline.linkPrediction.addMLP('pipe',
+{hiddenLayerSizes: [4, 2], penalty: 1, patience: 2})
+YIELD parameterSpace
+
+CALL gds.graph.project(
+  'myGraph',
+  {
+    my_entity: {
+      properties: ['price','sale_rank']
+    }
+  },
+  {
+    also_bought: {
+      orientation: 'UNDIRECTED'
+    }
+  }
+)
+
+CALL gds.beta.pipeline.linkPrediction.train.estimate('myGraph', {
+  pipeline: 'pipe',
+  modelName: 'lp-pipeline-model',
+  targetRelationshipType: 'also_bought'
+})
+YIELD requiredMemory
+
+CALL gds.beta.pipeline.linkPrediction.train('myGraph', {
+  pipeline: 'pipe',
+  modelName: 'lp-pipeline-model',
+  metrics: ['AUCPR', 'OUT_OF_BAG_ERROR'],
+  targetRelationshipType: 'also_bought',
+  randomSeed: 73
+}) YIELD modelInfo, modelSelectionStats
+RETURN
+  modelInfo.bestParameters AS winningModel,
+  modelInfo.metrics.AUCPR.train.avg AS avgTrainScore,
+  modelInfo.metrics.AUCPR.outerTrain AS outerTrainScore,
+  modelInfo.metrics.AUCPR.test AS testScore,
+  [cand IN modelSelectionStats.modelCandidates | cand.metrics.AUCPR.validation.avg] AS validationScores
+
+CALL gds.beta.pipeline.linkPrediction.predict.stream('myGraph', {
+  modelName: 'lp-pipeline-model',
+  topN: 5,
+  threshold: 0.5
+})
+ YIELD node1, node2, probability
+ RETURN gds.util.asNode(node1).name AS person1, gds.util.asNode(node2).name AS person2, probability
+ ORDER BY probability DESC, person1
